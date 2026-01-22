@@ -63,19 +63,223 @@ func main() {
 	}
 	defer func() { _ = bh.Stop() }()
 
+	bh.Handle(func(ctx *th.Context, update telego.Update) error {
+		if update.Message != nil && update.Message.From != nil {
+			_ = store.UpsertTelegramUsername(update.Message.From.Username, update.Message.From.ID)
+		}
+		if update.CallbackQuery != nil {
+			_ = store.UpsertTelegramUsername(update.CallbackQuery.From.Username, update.CallbackQuery.From.ID)
+		}
+		return ctx.Next(update)
+	})
+
+	resolveTelegramTarget := func(raw string) (int64, error) {
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			return 0, fmt.Errorf("потрібен користувач Telegram")
+		}
+		if strings.HasPrefix(raw, "@") {
+			id, ok := store.ResolveTelegramHandle(raw)
+			if !ok {
+				return 0, fmt.Errorf("не знаю цього @username: %s (користувач має хоч раз написати боту/в чаті)", raw)
+			}
+			return id, nil
+		}
+		id, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil || id == 0 {
+			return 0, fmt.Errorf("некоректний id користувача Telegram")
+		}
+		return id, nil
+	}
+
+	isProjectAdmin := func(ctx context.Context, telegramID int64, projectID int64) (bool, error) {
+		link, ok := store.Get(telegramID)
+		if !ok {
+			return false, fmt.Errorf("Немає привʼязки. Використай /link <taiga_token>.")
+		}
+		client, err := taiga.NewClient(cfg.TaigaBaseURL, link.TaigaToken)
+		if err != nil {
+			return false, err
+		}
+		memberships, err := client.ListMemberships(ctx, projectID)
+		if err != nil {
+			return false, err
+		}
+		for _, m := range memberships {
+			if m.UserID != link.TaigaUserID {
+				continue
+			}
+			return m.IsAdmin || m.IsOwner, nil
+		}
+		return false, nil
+	}
+
 	bh.HandleMessage(func(ctx *th.Context, message telego.Message) error {
-		return sendText(ctx, message.Chat.ID, "Команди:\n/link <taiga_token>\n/me\n/unlink\n/projects\n/new\n/cancel\n/notifyhere\n/notifychat <chat_id>\n/notifypm\n/watch <project_id>\n/unwatch <project_id>\n/watches\n/task <project_id> [taiga_user_id] <subject> [| description]  (створює завдання)\n/taskto <project_id> <taiga_user_id> <subject> [| description]  (створює завдання)\n/my [project_id]  (показує user stories)")
+		return sendText(ctx, message.Chat.ID, "Команди:\n/link <taiga_token>\n/me\n/unlink\n/projects\n/new\n/cancel\n/notifyhere\n/notifychat <chat_id>\n/notifypm\n/watch <project_id>\n/unwatch <project_id>\n/watches\n/map <project_id> <taiga_user_id>  (reply)\n/mapid <project_id> <telegram_user_id> <taiga_user_id>\n/mappings <project_id>\n/adminlinkid <project_id> <telegram_user_id> <taiga_token>\n/task <project_id> [taiga_user_id] <subject> [| description]  (створює завдання)\n/taskto <project_id> <taiga_user_id> <subject> [| description]  (створює завдання)\n/my [project_id]  (показує user stories)")
 	}, th.CommandEqual("start"))
 
 	bh.HandleMessage(func(ctx *th.Context, message telego.Message) error {
 		if message.From == nil {
 			return sendText(ctx, message.Chat.ID, "Відсутня інформація про користувача")
 		}
-		newWizardMu.Lock()
-		delete(newWizard, message.From.ID)
-		newWizardMu.Unlock()
-		return sendText(ctx, message.Chat.ID, "Скасовано")
-	}, th.CommandEqual("cancel"))
+		if message.Chat.Type != "private" {
+			return sendText(ctx, message.Chat.ID, "Цю команду можна використовувати лише в приватному чаті")
+		}
+
+		args := strings.TrimSpace(commandArgs(message.Text))
+		parts := strings.Fields(args)
+		if len(parts) != 3 {
+			return sendText(ctx, message.Chat.ID, "Використання: /adminlinkid <project_id> <telegram_user_id|@username> <taiga_token>")
+		}
+		projectID, err := strconv.ParseInt(parts[0], 10, 64)
+		if err != nil || projectID <= 0 {
+			return sendText(ctx, message.Chat.ID, "Некоректний id проєкту")
+		}
+		targetTelegramID, err := resolveTelegramTarget(parts[1])
+		if err != nil {
+			return sendText(ctx, message.Chat.ID, err.Error())
+		}
+		taigaToken := parts[2]
+		if strings.TrimSpace(taigaToken) == "" {
+			return sendText(ctx, message.Chat.ID, "Потрібен taiga_token")
+		}
+
+		admin, err := isProjectAdmin(ctx, message.From.ID, projectID)
+		if err != nil {
+			return sendText(ctx, message.Chat.ID, fmt.Sprintf("Помилка перевірки прав: %v", err))
+		}
+		if !admin {
+			return sendText(ctx, message.Chat.ID, "Недостатньо прав: потрібен адміністратор проєкту в Taiga")
+		}
+
+		taigaClient, err := taiga.NewClient(cfg.TaigaBaseURL, taigaToken)
+		if err != nil {
+			return sendText(ctx, message.Chat.ID, fmt.Sprintf("Помилка клієнта Taiga: %v", err))
+		}
+		me, err := taigaClient.GetMe(ctx)
+		if err != nil {
+			return sendText(ctx, message.Chat.ID, fmt.Sprintf("Не вдалося перевірити taiga_token: %v", err))
+		}
+
+		link := storage.UserLink{
+			TelegramID:    targetTelegramID,
+			TaigaToken:    taigaToken,
+			TaigaUserID:   me.ID,
+			TaigaUserName: me.FullName,
+		}
+		if err := store.Save(link); err != nil {
+			return sendText(ctx, message.Chat.ID, fmt.Sprintf("Не вдалося зберегти привʼязку: %v", err))
+		}
+
+		_ = ctx.Bot().DeleteMessage(ctx, &telego.DeleteMessageParams{ChatID: tu.ID(message.Chat.ID), MessageID: message.MessageID})
+		return sendText(ctx, message.Chat.ID, fmt.Sprintf("Збережено привʼязку для Telegram %d -> Taiga %d", targetTelegramID, me.ID))
+	}, th.CommandEqual("adminlinkid"))
+
+	bh.HandleMessage(func(ctx *th.Context, message telego.Message) error {
+		if message.From == nil {
+			return sendText(ctx, message.Chat.ID, "Відсутня інформація про користувача")
+		}
+		args := strings.TrimSpace(commandArgs(message.Text))
+		parts := strings.Fields(args)
+		if len(parts) != 2 {
+			return sendText(ctx, message.Chat.ID, "Використання: /map <project_id> <taiga_user_id> (відповіддю на повідомлення користувача)")
+		}
+		if message.ReplyToMessage == nil || message.ReplyToMessage.From == nil {
+			return sendText(ctx, message.Chat.ID, "Команду /map потрібно надсилати у відповідь на повідомлення користувача")
+		}
+		projectID, err := strconv.ParseInt(parts[0], 10, 64)
+		if err != nil || projectID <= 0 {
+			return sendText(ctx, message.Chat.ID, "Некоректний id проєкту")
+		}
+		taigaUserID, err := strconv.ParseInt(parts[1], 10, 64)
+		if err != nil || taigaUserID <= 0 {
+			return sendText(ctx, message.Chat.ID, "Некоректний id користувача Taiga")
+		}
+
+		admin, err := isProjectAdmin(ctx, message.From.ID, projectID)
+		if err != nil {
+			return sendText(ctx, message.Chat.ID, fmt.Sprintf("Помилка перевірки прав: %v", err))
+		}
+		if !admin {
+			return sendText(ctx, message.Chat.ID, "Недостатньо прав: потрібен адміністратор проєкту в Taiga")
+		}
+
+		targetTelegramID := message.ReplyToMessage.From.ID
+		if err := store.SetProjectUserMapping(projectID, targetTelegramID, taigaUserID); err != nil {
+			return sendText(ctx, message.Chat.ID, fmt.Sprintf("Не вдалося зберегти мапінг: %v", err))
+		}
+		return sendText(ctx, message.Chat.ID, fmt.Sprintf("Збережено мапінг: Telegram %d -> Taiga %d (проєкт %d)", targetTelegramID, taigaUserID, projectID))
+	}, th.CommandEqual("map"))
+
+	bh.HandleMessage(func(ctx *th.Context, message telego.Message) error {
+		if message.From == nil {
+			return sendText(ctx, message.Chat.ID, "Відсутня інформація про користувача")
+		}
+		args := strings.TrimSpace(commandArgs(message.Text))
+		parts := strings.Fields(args)
+		if len(parts) != 3 {
+			return sendText(ctx, message.Chat.ID, "Використання: /mapid <project_id> <telegram_user_id|@username> <taiga_user_id>")
+		}
+		projectID, err := strconv.ParseInt(parts[0], 10, 64)
+		if err != nil || projectID <= 0 {
+			return sendText(ctx, message.Chat.ID, "Некоректний id проєкту")
+		}
+		targetTelegramID, err := resolveTelegramTarget(parts[1])
+		if err != nil {
+			return sendText(ctx, message.Chat.ID, err.Error())
+		}
+		taigaUserID, err := strconv.ParseInt(parts[2], 10, 64)
+		if err != nil || taigaUserID <= 0 {
+			return sendText(ctx, message.Chat.ID, "Некоректний id користувача Taiga")
+		}
+
+		admin, err := isProjectAdmin(ctx, message.From.ID, projectID)
+		if err != nil {
+			return sendText(ctx, message.Chat.ID, fmt.Sprintf("Помилка перевірки прав: %v", err))
+		}
+		if !admin {
+			return sendText(ctx, message.Chat.ID, "Недостатньо прав: потрібен адміністратор проєкту в Taiga")
+		}
+		if err := store.SetProjectUserMapping(projectID, targetTelegramID, taigaUserID); err != nil {
+			return sendText(ctx, message.Chat.ID, fmt.Sprintf("Не вдалося зберегти мапінг: %v", err))
+		}
+		return sendText(ctx, message.Chat.ID, fmt.Sprintf("Збережено мапінг: Telegram %d -> Taiga %d (проєкт %d)", targetTelegramID, taigaUserID, projectID))
+	}, th.CommandEqual("mapid"))
+
+	bh.HandleMessage(func(ctx *th.Context, message telego.Message) error {
+		if message.From == nil {
+			return sendText(ctx, message.Chat.ID, "Відсутня інформація про користувача")
+		}
+		args := strings.TrimSpace(commandArgs(message.Text))
+		projectID, err := strconv.ParseInt(args, 10, 64)
+		if err != nil || projectID <= 0 {
+			return sendText(ctx, message.Chat.ID, "Використання: /mappings <project_id>")
+		}
+
+		admin, err := isProjectAdmin(ctx, message.From.ID, projectID)
+		if err != nil {
+			return sendText(ctx, message.Chat.ID, fmt.Sprintf("Помилка перевірки прав: %v", err))
+		}
+		if !admin {
+			return sendText(ctx, message.Chat.ID, "Недостатньо прав: потрібен адміністратор проєкту в Taiga")
+		}
+
+		m := store.ListProjectUserMappings(projectID)
+		if len(m) == 0 {
+			return sendText(ctx, message.Chat.ID, "Немає мапінгів")
+		}
+		ids := make([]int64, 0, len(m))
+		for id := range m {
+			ids = append(ids, id)
+		}
+		sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+		var b strings.Builder
+		b.WriteString(fmt.Sprintf("Мапінги для проєкту %d:\n", projectID))
+		for _, tgID := range ids {
+			b.WriteString(fmt.Sprintf("Telegram %d -> Taiga %d\n", tgID, m[tgID]))
+		}
+		return sendText(ctx, message.Chat.ID, b.String())
+	}, th.CommandEqual("mappings"))
 
 	bh.HandleMessage(func(ctx *th.Context, message telego.Message) error {
 		if message.From == nil {

@@ -3,7 +3,9 @@ package storage
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
+	"strings"
 	"sync"
 )
 
@@ -26,16 +28,27 @@ type TaskDigest struct {
 
 // Store persists user links.
 type Store struct {
-	path string
-	mu   sync.Mutex
-	data map[int64]UserLink
+	path  string
+	mu    sync.Mutex
+	links map[int64]UserLink
+
+	projectUserMappings map[int64]map[int64]int64
+	telegramUsernames   map[string]int64
+}
+
+type diskData struct {
+	Links               map[int64]UserLink        `json:"links"`
+	ProjectUserMappings map[int64]map[int64]int64 `json:"project_user_mappings,omitempty"`
+	TelegramUsernames   map[string]int64          `json:"telegram_usernames,omitempty"`
 }
 
 // New creates or loads a store from disk.
 func New(path string) (*Store, error) {
 	store := &Store{
-		path: path,
-		data: make(map[int64]UserLink),
+		path:                path,
+		links:               make(map[int64]UserLink),
+		projectUserMappings: make(map[int64]map[int64]int64),
+		telegramUsernames:   make(map[string]int64),
 	}
 	if err := store.load(); err != nil {
 		return nil, err
@@ -47,7 +60,7 @@ func New(path string) (*Store, error) {
 func (s *Store) Get(telegramID int64) (UserLink, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	link, ok := s.data[telegramID]
+	link, ok := s.links[telegramID]
 	return link, ok
 }
 
@@ -58,7 +71,7 @@ func (s *Store) Save(link UserLink) error {
 	if link.LastTaskStates == nil {
 		link.LastTaskStates = make(map[int64]TaskDigest)
 	}
-	s.data[link.TelegramID] = link
+	s.links[link.TelegramID] = link
 	return s.persist()
 }
 
@@ -66,7 +79,7 @@ func (s *Store) Save(link UserLink) error {
 func (s *Store) Delete(telegramID int64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	delete(s.data, telegramID)
+	delete(s.links, telegramID)
 	return s.persist()
 }
 
@@ -74,43 +87,155 @@ func (s *Store) Delete(telegramID int64) error {
 func (s *Store) UpdateTaskState(telegramID int64, digests map[int64]TaskDigest) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	link, ok := s.data[telegramID]
+	link, ok := s.links[telegramID]
 	if !ok {
 		return fmt.Errorf("користувач %d не привʼязаний", telegramID)
 	}
 	link.LastTaskStates = digests
-	s.data[telegramID] = link
+	s.links[telegramID] = link
 	return s.persist()
 }
 
 func (s *Store) SetNotifyChat(telegramID int64, chatID *int64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	link, ok := s.data[telegramID]
+	link, ok := s.links[telegramID]
 	if !ok {
 		return fmt.Errorf("користувач %d не привʼязаний", telegramID)
 	}
 	link.NotifyChatID = chatID
-	s.data[telegramID] = link
+	s.links[telegramID] = link
 	return s.persist()
+}
+
+func (s *Store) SetProjectUserMapping(projectID int64, telegramID int64, taigaUserID int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if projectID <= 0 {
+		return fmt.Errorf("некоректний id проєкту")
+	}
+	if telegramID == 0 {
+		return fmt.Errorf("некоректний id користувача Telegram")
+	}
+	if taigaUserID <= 0 {
+		return fmt.Errorf("некоректний id користувача Taiga")
+	}
+	if s.projectUserMappings == nil {
+		s.projectUserMappings = make(map[int64]map[int64]int64)
+	}
+	if s.projectUserMappings[projectID] == nil {
+		s.projectUserMappings[projectID] = make(map[int64]int64)
+	}
+	s.projectUserMappings[projectID][telegramID] = taigaUserID
+	return s.persist()
+}
+
+func (s *Store) RemoveProjectUserMapping(projectID int64, telegramID int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if projectID <= 0 {
+		return fmt.Errorf("некоректний id проєкту")
+	}
+	if telegramID == 0 {
+		return fmt.Errorf("некоректний id користувача Telegram")
+	}
+	if s.projectUserMappings == nil {
+		return nil
+	}
+	if s.projectUserMappings[projectID] == nil {
+		return nil
+	}
+	delete(s.projectUserMappings[projectID], telegramID)
+	if len(s.projectUserMappings[projectID]) == 0 {
+		delete(s.projectUserMappings, projectID)
+	}
+	return s.persist()
+}
+
+func (s *Store) GetProjectUserMapping(projectID int64, telegramID int64) (int64, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.projectUserMappings == nil {
+		return 0, false
+	}
+	m, ok := s.projectUserMappings[projectID]
+	if !ok {
+		return 0, false
+	}
+	taigaUserID, ok := m[telegramID]
+	return taigaUserID, ok
+}
+
+func (s *Store) ListProjectUserMappings(projectID int64) map[int64]int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	result := make(map[int64]int64)
+	if s.projectUserMappings == nil {
+		return result
+	}
+	m, ok := s.projectUserMappings[projectID]
+	if !ok {
+		return result
+	}
+	for k, v := range m {
+		result[k] = v
+	}
+	return result
+}
+
+func (s *Store) UpsertTelegramUsername(username string, telegramID int64) error {
+	username = strings.TrimSpace(username)
+	if username == "" || telegramID == 0 {
+		return nil
+	}
+	username = strings.TrimPrefix(username, "@")
+	username = strings.ToLower(username)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.telegramUsernames == nil {
+		s.telegramUsernames = make(map[string]int64)
+	}
+	if existing, ok := s.telegramUsernames[username]; ok && existing == telegramID {
+		return nil
+	}
+	s.telegramUsernames[username] = telegramID
+	return s.persist()
+}
+
+func (s *Store) ResolveTelegramHandle(handle string) (int64, bool) {
+	handle = strings.TrimSpace(handle)
+	if handle == "" {
+		return 0, false
+	}
+	handle = strings.TrimPrefix(handle, "@")
+	handle = strings.ToLower(handle)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.telegramUsernames == nil {
+		return 0, false
+	}
+	id, ok := s.telegramUsernames[handle]
+	return id, ok
 }
 
 // AddWatchedProject subscribes a telegram user to a Taiga project.
 func (s *Store) AddWatchedProject(telegramID int64, projectID int64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	link, ok := s.data[telegramID]
+	link, ok := s.links[telegramID]
 	if !ok {
 		return fmt.Errorf("користувач %d не привʼязаний", telegramID)
 	}
 	for _, existing := range link.WatchedProjects {
 		if existing == projectID {
-			s.data[telegramID] = link
+			s.links[telegramID] = link
 			return s.persist()
 		}
 	}
 	link.WatchedProjects = append(link.WatchedProjects, projectID)
-	s.data[telegramID] = link
+	s.links[telegramID] = link
 	return s.persist()
 }
 
@@ -118,7 +243,7 @@ func (s *Store) AddWatchedProject(telegramID int64, projectID int64) error {
 func (s *Store) RemoveWatchedProject(telegramID int64, projectID int64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	link, ok := s.data[telegramID]
+	link, ok := s.links[telegramID]
 	if !ok {
 		return fmt.Errorf("користувач %d не привʼязаний", telegramID)
 	}
@@ -129,7 +254,7 @@ func (s *Store) RemoveWatchedProject(telegramID int64, projectID int64) error {
 		}
 	}
 	link.WatchedProjects = filtered
-	s.data[telegramID] = link
+	s.links[telegramID] = link
 	return s.persist()
 }
 
@@ -137,8 +262,8 @@ func (s *Store) RemoveWatchedProject(telegramID int64, projectID int64) error {
 func (s *Store) List() []UserLink {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	result := make([]UserLink, 0, len(s.data))
-	for _, link := range s.data {
+	result := make([]UserLink, 0, len(s.links))
+	for _, link := range s.links {
 		result = append(result, link)
 	}
 	return result
@@ -153,11 +278,28 @@ func (s *Store) load() error {
 		return err
 	}
 	defer file.Close()
-
-	decoder := json.NewDecoder(file)
-	if err := decoder.Decode(&s.data); err != nil {
+	raw, err := io.ReadAll(file)
+	if err != nil {
 		return fmt.Errorf("не вдалося прочитати сховище: %w", err)
 	}
+
+	var dd diskData
+	if err := json.Unmarshal(raw, &dd); err == nil && dd.Links != nil {
+		s.links = dd.Links
+		if dd.ProjectUserMappings != nil {
+			s.projectUserMappings = dd.ProjectUserMappings
+		}
+		if dd.TelegramUsernames != nil {
+			s.telegramUsernames = dd.TelegramUsernames
+		}
+		return nil
+	}
+
+	var legacy map[int64]UserLink
+	if err := json.Unmarshal(raw, &legacy); err != nil {
+		return fmt.Errorf("не вдалося прочитати сховище: %w", err)
+	}
+	s.links = legacy
 	return nil
 }
 
@@ -169,7 +311,14 @@ func (s *Store) persist() error {
 	}
 	encoder := json.NewEncoder(file)
 	encoder.SetIndent("", "  ")
-	if err := encoder.Encode(s.data); err != nil {
+	data := diskData{Links: s.links}
+	if len(s.projectUserMappings) > 0 {
+		data.ProjectUserMappings = s.projectUserMappings
+	}
+	if len(s.telegramUsernames) > 0 {
+		data.TelegramUsernames = s.telegramUsernames
+	}
+	if err := encoder.Encode(data); err != nil {
 		file.Close()
 		return fmt.Errorf("не вдалося записати сховище: %w", err)
 	}
