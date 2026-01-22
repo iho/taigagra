@@ -1,7 +1,21 @@
+//
+// Copyright (c) 2026 Sumicare
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package taiga
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -20,7 +34,7 @@ func TestClient_ListMemberships(t *testing.T) {
 			t.Fatalf("NewClient: %v", err)
 		}
 
-		_, err = c.ListMemberships(context.Background(), 0)
+		_, err = c.ListMemberships(t.Context(), 0)
 		if err == nil {
 			t.Fatalf("expected error")
 		}
@@ -39,26 +53,38 @@ func TestClient_ListMemberships(t *testing.T) {
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if r.Method != http.MethodGet {
 				errCh <- fmt.Errorf("unexpected method: %s", r.Method)
+
 				w.WriteHeader(http.StatusBadRequest)
+
 				return
 			}
+
 			if r.URL.Path != "/api/v1/memberships" {
 				errCh <- fmt.Errorf("unexpected path: %s", r.URL.Path)
+
 				w.WriteHeader(http.StatusBadRequest)
+
 				return
 			}
+
 			if got := r.URL.Query().Get("project"); got != "1" {
 				errCh <- fmt.Errorf("unexpected project query: %q", got)
+
 				w.WriteHeader(http.StatusBadRequest)
+
 				return
 			}
+
 			if got := r.Header.Get("Authorization"); got != "Bearer token" {
 				errCh <- fmt.Errorf("unexpected auth header: %q", got)
+
 				w.WriteHeader(http.StatusBadRequest)
+
 				return
 			}
 
 			w.Header().Set("Content-Type", "application/json")
+
 			_ = json.NewEncoder(w).Encode(expected)
 		}))
 		defer srv.Close()
@@ -68,10 +94,11 @@ func TestClient_ListMemberships(t *testing.T) {
 			t.Fatalf("NewClient: %v", err)
 		}
 
-		got, err := c.ListMemberships(context.Background(), 1)
+		got, err := c.ListMemberships(t.Context(), 1)
 		if err != nil {
 			t.Fatalf("ListMemberships: %v", err)
 		}
+
 		select {
 		case err := <-errCh:
 			t.Fatalf("server assertion failed: %v", err)
@@ -81,6 +108,7 @@ func TestClient_ListMemberships(t *testing.T) {
 		if len(got) != len(expected) {
 			t.Fatalf("unexpected len: got=%d want=%d", len(got), len(expected))
 		}
+
 		for i := range expected {
 			if got[i] != expected[i] {
 				t.Fatalf("unexpected item[%d]: got=%+v want=%+v", i, got[i], expected[i])

@@ -1,3 +1,18 @@
+//
+// Copyright (c) 2026 Sumicare
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package storage
 
 import (
@@ -11,6 +26,7 @@ func TestStore_ProjectUserMappings(t *testing.T) {
 	t.Parallel()
 
 	path := filepath.Join(t.TempDir(), "store.json")
+
 	st, err := New(path)
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -28,6 +44,7 @@ func TestStore_ProjectUserMappings(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected mapping")
 	}
+
 	if got != taigaUserID {
 		t.Fatalf("unexpected mapping: got=%d want=%d", got, taigaUserID)
 	}
@@ -36,6 +53,7 @@ func TestStore_ProjectUserMappings(t *testing.T) {
 	if len(m) != 1 {
 		t.Fatalf("unexpected mappings len: %d", len(m))
 	}
+
 	if m[telegramID] != taigaUserID {
 		t.Fatalf("unexpected mapping value: got=%d want=%d", m[telegramID], taigaUserID)
 	}
@@ -43,6 +61,7 @@ func TestStore_ProjectUserMappings(t *testing.T) {
 	if err := st.RemoveProjectUserMapping(projectID, telegramID); err != nil {
 		t.Fatalf("RemoveProjectUserMapping: %v", err)
 	}
+
 	_, ok = st.GetProjectUserMapping(projectID, telegramID)
 	if ok {
 		t.Fatalf("expected mapping to be removed")
@@ -62,10 +81,12 @@ func TestStore_LoadLegacyFormat(t *testing.T) {
 			LastTaskStates: map[int64]TaskDigest{},
 		},
 	}
+
 	b, err := json.Marshal(legacy)
 	if err != nil {
 		t.Fatalf("Marshal legacy: %v", err)
 	}
+
 	if err := os.WriteFile(path, b, 0o600); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
@@ -74,10 +95,12 @@ func TestStore_LoadLegacyFormat(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
+
 	link, ok := st.Get(123)
 	if !ok {
 		t.Fatalf("expected link")
 	}
+
 	if link.TaigaUserID != 456 {
 		t.Fatalf("unexpected taiga user id: %d", link.TaigaUserID)
 	}
@@ -87,6 +110,7 @@ func TestStore_TelegramUsernameIndex(t *testing.T) {
 	t.Parallel()
 
 	path := filepath.Join(t.TempDir(), "store.json")
+
 	st, err := New(path)
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -95,6 +119,7 @@ func TestStore_TelegramUsernameIndex(t *testing.T) {
 	if err := st.UpsertTelegramUsername("", 1); err != nil {
 		t.Fatalf("UpsertTelegramUsername: %v", err)
 	}
+
 	if err := st.UpsertTelegramUsername("User", 0); err != nil {
 		t.Fatalf("UpsertTelegramUsername: %v", err)
 	}
@@ -102,6 +127,7 @@ func TestStore_TelegramUsernameIndex(t *testing.T) {
 	if err := st.UpsertTelegramUsername("TestUser", 123); err != nil {
 		t.Fatalf("UpsertTelegramUsername: %v", err)
 	}
+
 	if err := st.UpsertTelegramUsername("@TestUser", 123); err != nil {
 		t.Fatalf("UpsertTelegramUsername: %v", err)
 	}
@@ -110,6 +136,7 @@ func TestStore_TelegramUsernameIndex(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected resolve")
 	}
+
 	if got != 123 {
 		t.Fatalf("unexpected id: got=%d want=%d", got, 123)
 	}
@@ -118,10 +145,12 @@ func TestStore_TelegramUsernameIndex(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
+
 	got, ok = st2.ResolveTelegramHandle("testuser")
 	if !ok {
 		t.Fatalf("expected resolve after reload")
 	}
+
 	if got != 123 {
 		t.Fatalf("unexpected id after reload: got=%d want=%d", got, 123)
 	}
