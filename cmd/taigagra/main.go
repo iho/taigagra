@@ -1245,7 +1245,13 @@ func splitSubjectDescription(raw string) (subject, description string) {
 func dailyAssignedDigest(ctx context.Context, bot *telego.Bot, store *storage.Store, taigaBaseURL string) {
 	loc, err := time.LoadLocation("Europe/Kyiv")
 	if err != nil {
-		loc = time.Local
+		loc2, err2 := time.LoadLocation("Europe/Kiev")
+		if err2 != nil {
+			log.Printf("load tz Europe/Kyiv failed: %v; Europe/Kiev failed: %v; fallback to Local", err, err2)
+			loc = time.Local
+		} else {
+			loc = loc2
+		}
 	}
 
 	for {
@@ -1255,6 +1261,7 @@ func dailyAssignedDigest(ctx context.Context, bot *telego.Bot, store *storage.St
 		if !next.After(now) {
 			next = next.Add(24 * time.Hour)
 		}
+		log.Printf("daily digest scheduled: now=%s next=%s tz=%s", now.Format(time.RFC3339), next.Format(time.RFC3339), loc)
 
 		wait := time.NewTimer(time.Until(next))
 
@@ -1267,6 +1274,7 @@ func dailyAssignedDigest(ctx context.Context, bot *telego.Bot, store *storage.St
 		}
 
 		links := store.List()
+		log.Printf("daily digest triggered: links=%d", len(links))
 		for _, link := range links {
 			if strings.TrimSpace(link.TaigaToken) == "" || link.TaigaUserID <= 0 {
 				continue
@@ -1276,6 +1284,7 @@ func dailyAssignedDigest(ctx context.Context, bot *telego.Bot, store *storage.St
 			if link.NotifyChatID != nil {
 				destinationChatID = *link.NotifyChatID
 			}
+			log.Printf("daily digest send: telegram_id=%d destination_chat_id=%d", link.TelegramID, destinationChatID)
 
 			client, err := taiga.NewClient(taigaBaseURL, link.TaigaToken)
 			if err != nil {
@@ -1376,14 +1385,12 @@ func pollNotifications(ctx context.Context, bot *telego.Bot, store *storage.Stor
 
 					old, ok := last[us.ID]
 					if !ok {
+						_, _ = bot.SendMessage(ctx, tu.Message(tu.ID(destinationChatID), fmt.Sprintf("Нове завдання: #%d %s [%s]", us.Ref, us.Subject, us.StatusExtraInfo.Name)))
 						continue
 					}
 
 					if old.Status != digest.Status {
-						_, _ = bot.SendMessage(
-							ctx,
-							tu.Message(tu.ID(destinationChatID), fmt.Sprintf("Статус завдання змінено: #%d %s (%s -> %s)", us.Ref, us.Subject, old.Status, digest.Status)),
-						)
+						_, _ = bot.SendMessage(ctx, tu.Message(tu.ID(destinationChatID), fmt.Sprintf("Статус завдання змінено: #%d %s (%s -> %s)", us.Ref, us.Subject, old.Status, digest.Status)))
 						continue
 					}
 
