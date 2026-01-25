@@ -1286,10 +1286,10 @@ func dailyAssignedDigest(ctx context.Context, bot *telego.Bot, store *storage.St
 				continue
 			}
 
-			destinationChatID := link.TelegramID
-			if link.NotifyChatID != nil {
-				destinationChatID = *link.NotifyChatID
+			if link.NotifyChatID == nil {
+				continue
 			}
+			destinationChatID := *link.NotifyChatID
 			log.Printf("daily digest send: telegram_id=%d destination_chat_id=%d", link.TelegramID, destinationChatID)
 
 			linkCopy := link
@@ -1344,10 +1344,10 @@ func pollNotifications(ctx context.Context, bot *telego.Bot, store *storage.Stor
 					last = make(map[int64]storage.TaskDigest)
 				}
 
-				destinationChatID := link.TelegramID
-				if link.NotifyChatID != nil {
-					destinationChatID = *link.NotifyChatID
+				if link.NotifyChatID == nil {
+					continue
 				}
+				destinationChatID := *link.NotifyChatID
 
 				baselineOnly := len(last) == 0
 
