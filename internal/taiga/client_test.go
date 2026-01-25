@@ -16,10 +16,13 @@
 package taiga
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -115,4 +118,93 @@ func TestClient_ListMemberships(t *testing.T) {
 			}
 		}
 	})
+}
+
+func TestClient_AutoRefreshOnUnauthorized(t *testing.T) {
+	t.Parallel()
+
+	const (
+		oldAuth    = "old-auth"
+		oldRefresh = "old-refresh"
+		newAuth    = "new-auth"
+		newRefresh = "new-refresh"
+		projectID  = int64(1)
+	)
+
+	var membershipsCalls int
+	var refreshCalls int
+	var gotAuthAfterRefresh string
+	var gotRefreshAfterRefresh string
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/memberships":
+			membershipsCalls++
+			if membershipsCalls == 1 {
+				w.WriteHeader(http.StatusUnauthorized)
+				return
+			}
+			if got := r.Header.Get("Authorization"); got != "Bearer "+newAuth {
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = w.Write([]byte("unexpected auth header: " + got))
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode([]Membership{{ID: 1, Project: projectID, UserID: 5, FullName: "Admin"}})
+		case "/api/v1/auth/refresh":
+			refreshCalls++
+			if r.Method != http.MethodPost {
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = w.Write([]byte("unexpected method"))
+				return
+			}
+			var req struct {
+				Refresh string `json:"refresh"`
+			}
+			body, _ := io.ReadAll(r.Body)
+			if err := json.NewDecoder(strings.NewReader(string(body))).Decode(&req); err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = w.Write([]byte("invalid json"))
+				return
+			}
+			if req.Refresh != oldRefresh {
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = w.Write([]byte("unexpected refresh"))
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]string{"auth_token": newAuth, "refresh": newRefresh})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	c, err := NewClientWithTokens(srv.URL+"/api/v1", oldAuth, oldRefresh, func(authToken, refreshToken string) {
+		gotAuthAfterRefresh = authToken
+		gotRefreshAfterRefresh = refreshToken
+	})
+	if err != nil {
+		t.Fatalf("NewClientWithTokens: %v", err)
+	}
+
+	got, err := c.ListMemberships(context.Background(), projectID)
+	if err != nil {
+		t.Fatalf("ListMemberships: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("unexpected len: %d", len(got))
+	}
+	if membershipsCalls != 2 {
+		t.Fatalf("unexpected memberships calls: %d", membershipsCalls)
+	}
+	if refreshCalls != 1 {
+		t.Fatalf("unexpected refresh calls: %d", refreshCalls)
+	}
+	if gotAuthAfterRefresh != newAuth {
+		t.Fatalf("unexpected callback auth token")
+	}
+	if gotRefreshAfterRefresh != newRefresh {
+		t.Fatalf("unexpected callback refresh token")
+	}
 }

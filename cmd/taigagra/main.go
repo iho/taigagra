@@ -116,13 +116,32 @@ func main() {
 		return id, nil
 	}
 
+	newTaigaClient := func(telegramID int64) (*taiga.Client, error) {
+		link, ok := store.Get(telegramID)
+		if !ok {
+			return nil, fmt.Errorf("Немає привʼязки. Використай /link <auth_token> <refresh_token>.")
+		}
+
+		return taiga.NewClientWithTokens(cfg.TaigaBaseURL, link.TaigaToken, link.TaigaRefresh, func(authToken, refreshToken string) {
+			updated := link
+			updated.TaigaToken = authToken
+			updated.TaigaRefresh = refreshToken
+			_ = store.Save(updated)
+		})
+	}
+
 	isProjectAdmin := func(ctx context.Context, telegramID, projectID int64) (bool, error) {
 		link, ok := store.Get(telegramID)
 		if !ok {
-			return false, errors.New("Немає привʼязки. Використай /link <taiga_token>.")
+			return false, errors.New("Немає привʼязки. Використай /link <auth_token> <refresh_token>.")
 		}
 
-		client, err := taiga.NewClient(cfg.TaigaBaseURL, link.TaigaToken)
+		client, err := taiga.NewClientWithTokens(cfg.TaigaBaseURL, link.TaigaToken, link.TaigaRefresh, func(authToken, refreshToken string) {
+			updated := link
+			updated.TaigaToken = authToken
+			updated.TaigaRefresh = refreshToken
+			_ = store.Save(updated)
+		})
 		if err != nil {
 			return false, err
 		}
@@ -147,7 +166,7 @@ func main() {
 		return sendText(
 			ctx,
 			message.Chat.ID,
-			"Команди:\n/link <taiga_token>\n/me\n/unlink\n/projects\n/new\n/cancel\n/notifyhere\n/notifychat <chat_id>\n/notifypm\n/watch <project_id>\n/unwatch <project_id>\n/watches\n/map <project_id> <taiga_user_id>  (reply)\n/mapid <project_id> <telegram_user_id|@username> <taiga_user_id>\n/mappings <project_id>\n/adminlinkid <project_id> <telegram_user_id|@username> <taiga_token>\n/task <project_id> [taiga_user_id] <subject> [| description]  (створює завдання)\n/taskto <project_id> <taiga_user_id> <subject> [| description]  (створює завдання)\n/my [project_id]  (показує завдання)\n/myfor <project_id> <telegram_user_id|@username>  (показує завдання іншого користувача, лише для адміна проєкту)",
+			"Команди:\n/link <auth_token> <refresh_token>\n/me\n/unlink\n/projects\n/new\n/cancel\n/notifyhere\n/notifychat <chat_id>\n/notifypm\n/watch <project_id>\n/unwatch <project_id>\n/watches\n/map <project_id> <taiga_user_id>  (reply)\n/mapid <project_id> <telegram_user_id|@username> <taiga_user_id>\n/mappings <project_id>\n/adminlinkid <project_id> <telegram_user_id|@username> <auth_token> <refresh_token>\n/task <project_id> [taiga_user_id] <subject> [| description]  (створює завдання)\n/taskto <project_id> <taiga_user_id> <subject> [| description]  (створює завдання)\n/my [project_id]  (показує завдання)\n/myfor <project_id> <telegram_user_id|@username>  (показує завдання іншого користувача, лише для адміна проєкту)",
 		)
 	}, th.CommandEqual("start"))
 
@@ -163,8 +182,8 @@ func main() {
 		args := strings.TrimSpace(commandArgs(message.Text))
 
 		parts := strings.Fields(args)
-		if len(parts) != 3 {
-			return sendText(ctx, message.Chat.ID, "Використання: /adminlinkid <project_id> <telegram_user_id|@username> <taiga_token>")
+		if len(parts) != 4 {
+			return sendText(ctx, message.Chat.ID, "Використання: /adminlinkid <project_id> <telegram_user_id|@username> <auth_token> <refresh_token>")
 		}
 
 		projectID, err := strconv.ParseInt(parts[0], 10, 64)
@@ -177,9 +196,13 @@ func main() {
 			return sendText(ctx, message.Chat.ID, err.Error())
 		}
 
-		taigaToken := parts[2]
-		if strings.TrimSpace(taigaToken) == "" {
-			return sendText(ctx, message.Chat.ID, "Потрібен taiga_token")
+		authToken := parts[2]
+		refreshToken := parts[3]
+		if strings.TrimSpace(authToken) == "" {
+			return sendText(ctx, message.Chat.ID, "Потрібен auth_token")
+		}
+		if strings.TrimSpace(refreshToken) == "" {
+			return sendText(ctx, message.Chat.ID, "Потрібен refresh_token")
 		}
 
 		admin, err := isProjectAdmin(ctx, message.From.ID, projectID)
@@ -191,19 +214,20 @@ func main() {
 			return sendText(ctx, message.Chat.ID, "Недостатньо прав: потрібен адміністратор проєкту в Taiga")
 		}
 
-		taigaClient, err := taiga.NewClient(cfg.TaigaBaseURL, taigaToken)
+		taigaClient, err := taiga.NewClientWithTokens(cfg.TaigaBaseURL, authToken, refreshToken, nil)
 		if err != nil {
 			return sendText(ctx, message.Chat.ID, fmt.Sprintf("Помилка клієнта Taiga: %v", err))
 		}
 
 		me, err := taigaClient.GetMe(ctx)
 		if err != nil {
-			return sendText(ctx, message.Chat.ID, fmt.Sprintf("Не вдалося перевірити taiga_token: %v", err))
+			return sendText(ctx, message.Chat.ID, fmt.Sprintf("Не вдалося перевірити токени Taiga: %v", err))
 		}
 
 		link := storage.UserLink{
 			TelegramID:    targetTelegramID,
-			TaigaToken:    taigaToken,
+			TaigaToken:    authToken,
+			TaigaRefresh:  refreshToken,
 			TaigaUserID:   me.ID,
 			TaigaUserName: me.FullName,
 		}
@@ -350,12 +374,7 @@ func main() {
 			return sendText(ctx, message.Chat.ID, "Відсутня інформація про користувача")
 		}
 
-		link, ok := store.Get(message.From.ID)
-		if !ok {
-			return sendText(ctx, message.Chat.ID, "Немає привʼязки. Використай /link <taiga_token>.")
-		}
-
-		client, err := taiga.NewClient(cfg.TaigaBaseURL, link.TaigaToken)
+		client, err := newTaigaClient(message.From.ID)
 		if err != nil {
 			return sendText(ctx, message.Chat.ID, fmt.Sprintf("Помилка клієнта Taiga: %v", err))
 		}
@@ -447,13 +466,7 @@ func main() {
 
 			newWizardMu.Unlock()
 
-			link, ok := store.Get(telegramID)
-			if !ok {
-				_ = ctx.Bot().AnswerCallbackQuery(ctx, tu.CallbackQuery(query.ID).WithText("Немає привʼязки"))
-				return nil
-			}
-
-			client, err := taiga.NewClient(cfg.TaigaBaseURL, link.TaigaToken)
+			client, err := newTaigaClient(telegramID)
 			if err != nil {
 				_ = ctx.Bot().AnswerCallbackQuery(ctx, tu.CallbackQuery(query.ID).WithText("Помилка"))
 				_, _ = ctx.Bot().SendMessage(ctx, tu.Message(tu.ID(chatID), fmt.Sprintf("Помилка клієнта Taiga: %v", err)))
@@ -578,12 +591,7 @@ func main() {
 			return sendText(ctx, message.Chat.ID, "Потрібна тема")
 		}
 
-		link, ok := store.Get(message.From.ID)
-		if !ok {
-			return sendText(ctx, message.Chat.ID, "Немає привʼязки. Використай /link <taiga_token>.")
-		}
-
-		client, err := taiga.NewClient(cfg.TaigaBaseURL, link.TaigaToken)
+		client, err := newTaigaClient(message.From.ID)
 		if err != nil {
 			return sendText(ctx, message.Chat.ID, fmt.Sprintf("Помилка клієнта Taiga: %v", err))
 		}
@@ -610,16 +618,21 @@ func main() {
 	bh.HandleMessage(func(ctx *th.Context, message telego.Message) error {
 		args := strings.TrimSpace(commandArgs(message.Text))
 		if args == "" {
-			return sendText(ctx, message.Chat.ID, "Використання: /link <taiga_token>")
+			return sendText(ctx, message.Chat.ID, "Використання: /link <auth_token> <refresh_token>")
 		}
 
 		if message.From == nil {
 			return sendText(ctx, message.Chat.ID, "Не можу привʼязати: відсутня інформація про користувача")
 		}
 
-		taigaToken := args
+		parts := strings.Fields(args)
+		if len(parts) != 2 {
+			return sendText(ctx, message.Chat.ID, "Використання: /link <auth_token> <refresh_token>")
+		}
+		authToken := parts[0]
+		refreshToken := parts[1]
 
-		client, err := taiga.NewClient(cfg.TaigaBaseURL, taigaToken)
+		client, err := taiga.NewClientWithTokens(cfg.TaigaBaseURL, authToken, refreshToken, nil)
 		if err != nil {
 			return sendText(ctx, message.Chat.ID, fmt.Sprintf("Помилка клієнта Taiga: %v", err))
 		}
@@ -631,7 +644,8 @@ func main() {
 
 		link := storage.UserLink{
 			TelegramID:     message.From.ID,
-			TaigaToken:     taigaToken,
+			TaigaToken:     authToken,
+			TaigaRefresh:   refreshToken,
 			TaigaUserID:    me.ID,
 			TaigaUserName:  me.FullName,
 			LastTaskStates: nil,
@@ -650,7 +664,7 @@ func main() {
 
 		link, ok := store.Get(message.From.ID)
 		if !ok {
-			return sendText(ctx, message.Chat.ID, "Немає привʼязки. Використай /link <taiga_token>.")
+			return sendText(ctx, message.Chat.ID, "Немає привʼязки. Використай /link <auth_token> <refresh_token>.")
 		}
 
 		return sendText(ctx, message.Chat.ID, fmt.Sprintf("Привʼязаний користувач Taiga: %s (%d)", link.TaigaUserName, link.TaigaUserID))
@@ -661,12 +675,11 @@ func main() {
 			return sendText(ctx, message.Chat.ID, "Відсутня інформація про користувача")
 		}
 
-		link, ok := store.Get(message.From.ID)
-		if !ok {
-			return sendText(ctx, message.Chat.ID, "Немає привʼязки. Використай /link <taiga_token>.")
+		if _, ok := store.Get(message.From.ID); !ok {
+			return sendText(ctx, message.Chat.ID, "Немає привʼязки. Використай /link <auth_token> <refresh_token>.")
 		}
 
-		client, err := taiga.NewClient(cfg.TaigaBaseURL, link.TaigaToken)
+		client, err := newTaigaClient(message.From.ID)
 		if err != nil {
 			return sendText(ctx, message.Chat.ID, fmt.Sprintf("Помилка клієнта Taiga: %v", err))
 		}
@@ -706,7 +719,7 @@ func main() {
 		}
 
 		if _, ok := store.Get(message.From.ID); !ok {
-			return sendText(ctx, message.Chat.ID, "Немає привʼязки. Використай /link <taiga_token>.")
+			return sendText(ctx, message.Chat.ID, "Немає привʼязки. Використай /link <auth_token> <refresh_token>.")
 		}
 
 		chatID := message.Chat.ID
@@ -724,7 +737,7 @@ func main() {
 		}
 
 		if _, ok := store.Get(message.From.ID); !ok {
-			return sendText(ctx, message.Chat.ID, "Немає привʼязки. Використай /link <taiga_token>.")
+			return sendText(ctx, message.Chat.ID, "Немає привʼязки. Використай /link <auth_token> <refresh_token>.")
 		}
 
 		chatID, err := parseChatID(commandArgs(message.Text))
@@ -745,11 +758,11 @@ func main() {
 		}
 
 		if _, ok := store.Get(message.From.ID); !ok {
-			return sendText(ctx, message.Chat.ID, "Немає привʼязки. Використай /link <taiga_token>.")
+			return sendText(ctx, message.Chat.ID, "Немає привʼязки. Використай /link <auth_token> <refresh_token>.")
 		}
 		err := store.SetNotifyChat(message.From.ID, nil)
 		if err != nil {
-			return sendText(ctx, message.Chat.ID, fmt.Sprintf("Не вдалося скинути чат для сповіщень: %v", err))
+			return sendText(ctx, message.Chat.ID, fmt.Sprintf("Не вдалося встановити приватні сповіщення: %v", err))
 		}
 
 		return sendText(ctx, message.Chat.ID, "Сповіщення надсилатимуться в приватний чат")
@@ -761,7 +774,7 @@ func main() {
 		}
 
 		if _, ok := store.Get(message.From.ID); !ok {
-			return sendText(ctx, message.Chat.ID, "Немає привʼязки. Використай /link <taiga_token>.")
+			return sendText(ctx, message.Chat.ID, "Немає привʼязки. Використай /link <auth_token> <refresh_token>.")
 		}
 
 		projectID, err := parseRequiredProjectID(commandArgs(message.Text))
@@ -782,7 +795,7 @@ func main() {
 		}
 
 		if _, ok := store.Get(message.From.ID); !ok {
-			return sendText(ctx, message.Chat.ID, "Немає привʼязки. Використай /link <taiga_token>.")
+			return sendText(ctx, message.Chat.ID, "Немає привʼязки. Використай /link <auth_token> <refresh_token>.")
 		}
 
 		projectID, err := parseRequiredProjectID(commandArgs(message.Text))
@@ -804,7 +817,7 @@ func main() {
 
 		link, ok := store.Get(message.From.ID)
 		if !ok {
-			return sendText(ctx, message.Chat.ID, "Немає привʼязки. Використай /link <taiga_token>.")
+			return sendText(ctx, message.Chat.ID, "Немає привʼязки. Використай /link <auth_token> <refresh_token>.")
 		}
 
 		if len(link.WatchedProjects) == 0 {
@@ -826,9 +839,8 @@ func main() {
 			return sendText(ctx, message.Chat.ID, "Відсутня інформація про користувача")
 		}
 
-		link, ok := store.Get(message.From.ID)
-		if !ok {
-			return sendText(ctx, message.Chat.ID, "Немає привʼязки. Використай /link <taiga_token>.")
+		if _, ok := store.Get(message.From.ID); !ok {
+			return sendText(ctx, message.Chat.ID, "Немає привʼязки. Використай /link <auth_token> <refresh_token>.")
 		}
 
 		projectID, assigneeID, subject, description, err := parseTaskTo(commandArgs(message.Text))
@@ -836,7 +848,7 @@ func main() {
 			return sendText(ctx, message.Chat.ID, err.Error())
 		}
 
-		client, err := taiga.NewClient(cfg.TaigaBaseURL, link.TaigaToken)
+		client, err := newTaigaClient(message.From.ID)
 		if err != nil {
 			return sendText(ctx, message.Chat.ID, fmt.Sprintf("Помилка клієнта Taiga: %v", err))
 		}
@@ -863,7 +875,7 @@ func main() {
 
 		link, ok := store.Get(message.From.ID)
 		if !ok {
-			return sendText(ctx, message.Chat.ID, "Немає привʼязки. Використай /link <taiga_token>.")
+			return sendText(ctx, message.Chat.ID, "Немає привʼязки. Використай /link <auth_token> <refresh_token>.")
 		}
 
 		projectID, assigneeID, subject, description, err := parseTaskWithOptionalAssignee(commandArgs(message.Text))
@@ -871,7 +883,7 @@ func main() {
 			return sendText(ctx, message.Chat.ID, err.Error())
 		}
 
-		client, err := taiga.NewClient(cfg.TaigaBaseURL, link.TaigaToken)
+		client, err := newTaigaClient(message.From.ID)
 		if err != nil {
 			return sendText(ctx, message.Chat.ID, fmt.Sprintf("Помилка клієнта Taiga: %v", err))
 		}
@@ -902,7 +914,7 @@ func main() {
 
 		link, ok := store.Get(message.From.ID)
 		if !ok {
-			return sendText(ctx, message.Chat.ID, "Немає привʼязки. Використай /link <taiga_token>.")
+			return sendText(ctx, message.Chat.ID, "Немає привʼязки. Використай /link <auth_token> <refresh_token>.")
 		}
 
 		projectID, err := parseOptionalProjectID(commandArgs(message.Text))
@@ -910,13 +922,12 @@ func main() {
 			return sendText(ctx, message.Chat.ID, err.Error())
 		}
 
-		client, err := taiga.NewClient(cfg.TaigaBaseURL, link.TaigaToken)
+		client, err := newTaigaClient(message.From.ID)
 		if err != nil {
 			return sendText(ctx, message.Chat.ID, fmt.Sprintf("Помилка клієнта Taiga: %v", err))
 		}
 
 		assigned := link.TaigaUserID
-
 		stories, err := client.ListUserStories(context.Background(), taiga.ListUserStoriesParams{ProjectID: projectID, AssignedTo: &assigned})
 		if err != nil {
 			return sendText(ctx, message.Chat.ID, fmt.Sprintf("Не вдалося отримати список завдання: %v", err))
@@ -965,12 +976,7 @@ func main() {
 			return sendText(ctx, message.Chat.ID, "Недостатньо прав: потрібен адміністратор проєкту в Taiga")
 		}
 
-		adminLink, ok := store.Get(message.From.ID)
-		if !ok {
-			return sendText(ctx, message.Chat.ID, "Немає привʼязки. Використай /link <taiga_token>.")
-		}
-
-		client, err := taiga.NewClient(cfg.TaigaBaseURL, adminLink.TaigaToken)
+		client, err := newTaigaClient(message.From.ID)
 		if err != nil {
 			return sendText(ctx, message.Chat.ID, fmt.Sprintf("Помилка клієнта Taiga: %v", err))
 		}
@@ -1286,7 +1292,13 @@ func dailyAssignedDigest(ctx context.Context, bot *telego.Bot, store *storage.St
 			}
 			log.Printf("daily digest send: telegram_id=%d destination_chat_id=%d", link.TelegramID, destinationChatID)
 
-			client, err := taiga.NewClient(taigaBaseURL, link.TaigaToken)
+			linkCopy := link
+			client, err := taiga.NewClientWithTokens(taigaBaseURL, linkCopy.TaigaToken, linkCopy.TaigaRefresh, func(authToken, refreshToken string) {
+				updated := linkCopy
+				updated.TaigaToken = authToken
+				updated.TaigaRefresh = refreshToken
+				_ = store.Save(updated)
+			})
 			if err != nil {
 				continue
 			}
@@ -1339,7 +1351,13 @@ func pollNotifications(ctx context.Context, bot *telego.Bot, store *storage.Stor
 
 				baselineOnly := len(last) == 0
 
-				client, err := taiga.NewClient(taigaBaseURL, link.TaigaToken)
+				linkCopy := link
+				client, err := taiga.NewClientWithTokens(taigaBaseURL, linkCopy.TaigaToken, linkCopy.TaigaRefresh, func(authToken, refreshToken string) {
+					updated := linkCopy
+					updated.TaigaToken = authToken
+					updated.TaigaRefresh = refreshToken
+					_ = store.Save(updated)
+				})
 				if err != nil {
 					continue
 				}

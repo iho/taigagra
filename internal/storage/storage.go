@@ -30,6 +30,7 @@ type UserLink struct {
 	NotifyChatID    *int64               `json:"notify_chat_id,omitempty"`
 	LastTaskStates  map[int64]TaskDigest `json:"last_task_states"`
 	TaigaToken      string               `json:"taiga_token"`
+	TaigaRefresh    string               `json:"taiga_refresh,omitempty"`
 	TaigaUserName   string               `json:"taiga_user_name"`
 	WatchedProjects []int64              `json:"watched_projects,omitempty"`
 	TelegramID      int64                `json:"telegram_id"`

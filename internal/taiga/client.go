@@ -33,6 +33,8 @@ type Client struct {
 	baseURL    *url.URL
 	httpClient *http.Client
 	authToken  string
+	refresh    string
+	onRefresh  func(authToken, refreshToken string)
 }
 
 // CreateUserStory creates a new user story in Taiga.
@@ -53,6 +55,10 @@ func (c *Client) CreateUserStory(ctx context.Context, req UserStoryCreateRequest
 
 // NewClient returns a configured Taiga API client.
 func NewClient(baseURL, authToken string) (*Client, error) {
+	return NewClientWithTokens(baseURL, authToken, "", nil)
+}
+
+func NewClientWithTokens(baseURL, authToken, refreshToken string, onTokensRefreshed func(authToken, refreshToken string)) (*Client, error) {
 	parsed, err := url.Parse(baseURL)
 	if err != nil {
 		return nil, fmt.Errorf("некоректний базовий URL Taiga: %w", err)
@@ -69,6 +75,8 @@ func NewClient(baseURL, authToken string) (*Client, error) {
 	return &Client{
 		baseURL:    parsed,
 		authToken:  authToken,
+		refresh:    refreshToken,
+		onRefresh:  onTokensRefreshed,
 		httpClient: &http.Client{},
 	}, nil
 }
@@ -285,6 +293,10 @@ func (c *Client) ListMemberships(ctx context.Context, projectID int64) ([]Member
 
 // do executes HTTP request and decodes the response.
 func (c *Client) do(ctx context.Context, method, endpoint string, payload, out any) error {
+	return c.doWithRetry(ctx, method, endpoint, payload, out, false)
+}
+
+func (c *Client) doWithRetry(ctx context.Context, method, endpoint string, payload, out any, refreshed bool) error {
 	var body io.Reader
 	if payload != nil {
 		buf, err := json.Marshal(payload)
@@ -319,6 +331,14 @@ func (c *Client) do(ctx context.Context, method, endpoint string, payload, out a
 		finalURL = resp.Request.URL.String()
 	}
 
+	if resp.StatusCode == http.StatusUnauthorized && !refreshed && strings.TrimSpace(c.refresh) != "" {
+		err := c.refreshAuth(ctx)
+		if err != nil {
+			return err
+		}
+		return c.doWithRetry(ctx, method, endpoint, payload, out, true)
+	}
+
 	if resp.StatusCode >= 300 {
 		return fmt.Errorf("помилка API Taiga (%d) з %s: %s", resp.StatusCode, finalURL, truncateForLog(string(bodyBytes), 1024))
 	}
@@ -334,6 +354,68 @@ func (c *Client) do(ctx context.Context, method, endpoint string, payload, out a
 
 	if err := json.NewDecoder(bytes.NewReader(bodyBytes)).Decode(out); err != nil {
 		return fmt.Errorf("не вдалося розібрати відповідь з %s (content-type %q): %w", finalURL, contentType, err)
+	}
+
+	return nil
+}
+
+func (c *Client) refreshAuth(ctx context.Context) error {
+	refresh := strings.TrimSpace(c.refresh)
+	if refresh == "" {
+		return fmt.Errorf("потрібен refresh токен")
+	}
+
+	endpoint := c.baseURL.ResolveReference(&url.URL{Path: "auth/refresh"})
+	payload := struct {
+		Refresh string `json:"refresh"`
+	}{
+		Refresh: refresh,
+	}
+
+	buf, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("не вдалося серіалізувати refresh-запит: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint.String(), bytes.NewReader(buf))
+	if err != nil {
+		return fmt.Errorf("не вдалося сформувати refresh-запит: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("не вдалося виконати refresh-запит: %w", err)
+	}
+	defer resp.Body.Close()
+
+	bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 2*1024*1024))
+	finalURL := endpoint.String()
+	if resp.Request != nil && resp.Request.URL != nil {
+		finalURL = resp.Request.URL.String()
+	}
+
+	if resp.StatusCode >= 300 {
+		return fmt.Errorf("помилка refresh API Taiga (%d) з %s: %s", resp.StatusCode, finalURL, truncateForLog(string(bodyBytes), 1024))
+	}
+
+	var out struct {
+		AuthToken string `json:"auth_token"`
+		Refresh   string `json:"refresh"`
+	}
+	if err := json.NewDecoder(bytes.NewReader(bodyBytes)).Decode(&out); err != nil {
+		return fmt.Errorf("не вдалося розібрати refresh-відповідь з %s: %w", finalURL, err)
+	}
+	if strings.TrimSpace(out.AuthToken) == "" {
+		return fmt.Errorf("refresh не повернув auth_token")
+	}
+
+	c.authToken = out.AuthToken
+	if strings.TrimSpace(out.Refresh) != "" {
+		c.refresh = out.Refresh
+	}
+	if c.onRefresh != nil {
+		c.onRefresh(c.authToken, c.refresh)
 	}
 
 	return nil
